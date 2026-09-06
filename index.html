@@ -377,12 +377,19 @@ function mergeConfig(cfg){
   return {
     departments: Array.isArray(cfg.departments) ? cfg.departments.map(dep=>({
       id: dep.id, name: dep.name,
-      courses: Array.isArray(dep.courses) ? dep.courses.map(c=>({
-        id: c.id, name: c.name,
-        steps: Array.isArray(c.steps) ? c.steps.map(s=> typeof s==='string' ? {id:stepId(), name:s} : s) : [],
-        deadline: c.deadline || "",
-        caseTypes: Array.isArray(c.caseTypes) ? c.caseTypes : []
-      })) : []
+      courses: Array.isArray(dep.courses) ? dep.courses.map(c=>{
+        const legacySteps = Array.isArray(c.steps) ? c.steps.map(s=> typeof s==='string' ? {id:stepId(), name:s} : s) : [];
+        const caseTypes = Array.isArray(c.caseTypes) ? c.caseTypes : [];
+        let caseTypeConfigs = Array.isArray(c.caseTypeConfigs) ? c.caseTypeConfigs.map(cc=>({
+          name: cc.name,
+          steps: Array.isArray(cc.steps) ? cc.steps.map(s=> typeof s==='string' ? {id:stepId(), name:s} : s) : []
+        })) : null;
+        if(!caseTypeConfigs){
+          // migrate from the old course-wide steps: give every assigned case type a copy of the old steps as a starting point
+          caseTypeConfigs = caseTypes.map(name=>({ name, steps: legacySteps.map(s=>({id: stepId(), name: s.name})) }));
+        }
+        return { id: c.id, name: c.name, deadline: c.deadline || "", caseTypes, caseTypeConfigs };
+      }) : []
     })) : d.departments,
     groups: Array.isArray(cfg.groups) ? cfg.groups : d.groups,
     subgroups: Array.isArray(cfg.subgroups) ? cfg.subgroups : d.subgroups,
@@ -396,10 +403,18 @@ function mergeConfig(cfg){
 function getDept(id){ return (CONFIG.departments||[]).find(d=>d.id===id) || null; }
 function getCourse(deptIdVal, courseIdVal){ const d = getDept(deptIdVal); if(!d) return null; return (d.courses||[]).find(c=>c.id===courseIdVal) || null; }
 function studentCourse(st){ return getCourse(st.departmentId, st.courseId); }
-function courseCaseTypes(course){ return (course && course.caseTypes && course.caseTypes.length) ? course.caseTypes : (CONFIG.caseTypes||[]); }
+function courseCaseTypes(course){ return (course && course.caseTypes) ? course.caseTypes : []; }
+function caseTypeConfig(course, caseTypeName){
+  if(!course) return null;
+  return (course.caseTypeConfigs||[]).find(c=>c.name===caseTypeName) || null;
+}
+function caseSteps(course, caseTypeName){
+  const cfg = caseTypeConfig(course, caseTypeName);
+  return cfg ? cfg.steps : [];
+}
 function studentHasStarted(st){
   return (st.cases||[]).some(cs=>{
-    const p = ((PROGRESS[st.id]||{})[cs.id])||{};
+    const p = PROGRESS[cs.id]||{};
     return Object.values(p).some(rec=>rec.done);
   });
 }
@@ -413,7 +428,7 @@ let state = {
   adminPass:null, adminTab:'departments', adminDeptId:'', adminCourseId:'',
   openStudent:null, openCase:null, search:'', loginMode:null, loginErr:'', loading:true, storageOk:true,
   importMsg:'', lang:(typeof localStorage!=='undefined' && localStorage.getItem('prostho_lang')) || 'ar',
-  statsScope:'all', statsScopeValue:'', statsStepId:'',
+  statsScope:'all', statsScopeValue:'', statsStepId:'', statsCaseTypeFilter:'',
   addingCaseFor:null, linkingPartnersFor:null
 };
 
@@ -427,9 +442,9 @@ function fmtDate(iso){
 
 function casePct(st, cs){
   const course = studentCourse(st);
-  const steps = course ? course.steps : [];
+  const steps = caseSteps(course, cs.caseType);
   if(!steps.length) return 0;
-  const p = ((PROGRESS[st.id]||{})[cs.id])||{};
+  const p = PROGRESS[cs.id]||{};
   const done = steps.filter(s => p[s.id] && p[s.id].done).length;
   return Math.round((done/steps.length)*100);
 }
@@ -440,7 +455,7 @@ function studentAggregatePct(st){
   return Math.round(total/cases.length);
 }
 function caseTotalGrade(st, cs){
-  const p = ((PROGRESS[st.id]||{})[cs.id])||{};
+  const p = PROGRESS[cs.id]||{};
   let sum = 0;
   Object.values(p).forEach(rec=>{ const n = parseFloat(rec.grade); if(!isNaN(n)) sum += n; });
   return sum;
@@ -561,8 +576,8 @@ function studentMetaLine(st){
 }
 function stepsHtmlForCase(st, cs, readonly){
   const course = studentCourse(st);
-  const steps = course ? course.steps : [];
-  const p = ((PROGRESS[st.id]||{})[cs.id])||{};
+  const steps = caseSteps(course, cs.caseType);
+  const p = PROGRESS[cs.id]||{};
   if(steps.length===0) return `<div class="empty"><p>—</p></div>`;
   const total = caseTotalGrade(st, cs);
   return `<div class="total-grade">${t('totalGradeLabel')}${total}</div>` + steps.map((step,i)=>{
@@ -590,6 +605,17 @@ function stepsHtmlForCase(st, cs, readonly){
 function partnerNames(st, cs){
   const ids = cs.partnerIds || [];
   return ids.map(id=>{ const p = STUDENTS.find(s=>s.id===id); return p ? p.name : null; }).filter(Boolean);
+}
+function partnerDisplayList(cs){
+  const ids = cs.partnerIds || [];
+  return ids.map(id=>{
+    const p = STUDENTS.find(s=>s.id===id);
+    if(!p) return null;
+    let label = esc(p.name);
+    if(p.studentCode) label += ' <span style="color:var(--teal-500);">#'+esc(p.studentCode)+'</span>';
+    const meta = [p.group?t('groupPrefix')+esc(p.group):'', p.subgroup?t('subgroupPrefix')+esc(p.subgroup):''].filter(Boolean).join(' · ');
+    return meta ? `${label} (${meta})` : label;
+  }).filter(Boolean);
 }
 function addCasePanelHtml(st){
   const course = studentCourse(st);
@@ -639,14 +665,15 @@ function casesHtml(st, readonly){
     const pct = casePct(st,cs);
     const total = caseTotalGrade(st,cs);
     const open = openCase===cs.id;
-    const partners = partnerNames(st,cs);
+    const partners = partnerDisplayList(cs);
     const linkingThis = state.linkingPartnersFor && state.linkingPartnersFor.sid===st.id && state.linkingPartnersFor.cid===cs.id;
     html += `
     <div class="case-item" data-act="toggle-case" data-sid="${st.id}" data-cid="${cs.id}">
       <div style="width:32px;flex-shrink:0;">${ringSvg(pct,32)}</div>
       <div class="ci-info">
         <div class="ci-name">${esc(cs.caseType || t('caseLabel'))}</div>
-        <div class="ci-meta">${t('totalGradeLabel')}${total}${partners.length ? ' · '+t('partnersLabel')+partners.map(esc).join('، ') : ''}</div>
+        <div class="ci-meta">${t('totalGradeLabel')}${total}</div>
+        ${partners.length ? `<div class="ci-meta">${t('partnersLabel')}${partners.join('، ')}</div>` : ''}
       </div>
       <div class="chev">${open?'▲':'▼'}</div>
     </div>
@@ -894,6 +921,10 @@ function adminStepsHtml(){
   if(!state.adminDeptId || !state.adminCourseId) return `<div class="banner">${t('pickContextHint')}</div>`;
   const course = getCourse(state.adminDeptId, state.adminCourseId);
   if(!course) return `<div class="banner">${t('pickContextHint')}</div>`;
+  const assignedTypes = course.caseTypes || [];
+  if(!state.stepsCaseType || !assignedTypes.includes(state.stepsCaseType)) state.stepsCaseType = assignedTypes[0] || '';
+  const activeConfig = state.stepsCaseType ? caseTypeConfig(course, state.stepsCaseType) : null;
+  const steps = activeConfig ? activeConfig.steps : [];
   return `
     <div class="card">
       <h2>${t('courseSettingsHeading')}</h2>
@@ -902,33 +933,40 @@ function adminStepsHtml(){
       <h3 class="section-title" style="margin-top:0;">${t('allowedCaseTypesHeading')}</h3>
       ${(CONFIG.caseTypes||[]).length===0 ? `<p style="font-size:12px;color:var(--teal-500);">—</p>` : `
       <div class="chip-row">
-        ${(CONFIG.caseTypes||[]).map((c,i)=>{
-          const checked = (course.caseTypes||[]).includes(c);
+        ${(CONFIG.caseTypes||[]).map((c)=>{
+          const checked = assignedTypes.includes(c);
           return `<label class="chip" style="cursor:pointer;background:${checked?'var(--gold-light)':'var(--teal-100)'};">
             <input type="checkbox" class="course-casetype-chk" value="${esc(c)}" ${checked?'checked':''} style="width:auto;margin:0;">
             ${esc(c)}
           </label>`;
         }).join('')}
       </div>`}
-      <p style="font-size:11.5px;color:var(--teal-500);margin:6px 0 10px;">${state.lang==='ar' ? 'سيبها كلها مفوّكة يعني كل الأنواع متاحة لهذا الـ Course.' : 'Leave all unchecked to make every type available for this course.'}</p>
       <button class="btn ghost sm" style="width:auto;" data-act="save-course-casetypes">${t('saveCaseTypesBtn')}</button>
     </div>
+
+    ${assignedTypes.length===0 ? `<div class="banner">${state.lang==='ar' ? 'خصص نوع حالة واحد على الأقل فوق قبل ما تقدر تضيفله خطوات.' : 'Assign at least one case type above before you can add steps to it.'}</div>` : `
+    <div class="field"><label>${state.lang==='ar' ? 'اختار الحالة لتعديل خطواتها' : 'Choose a case type to edit its steps'}</label>
+      <select id="steps-casetype-select">
+        ${assignedTypes.map(name=>`<option value="${esc(name)}" ${state.stepsCaseType===name?'selected':''}>${esc(name)}</option>`).join('')}
+      </select>
+    </div>
     <div class="card">
-      <h2>${t('addStepHeading')}</h2>
+      <h2>${t('addStepHeading')} — ${esc(state.stepsCaseType)}</h2>
       <div class="field"><label>${t('stepNameLabel')}</label><input type="text" id="new-step-name"></div>
       <button class="btn" data-act="add-step">${t('addStepBtn')}</button>
     </div>
-    <h3 class="section-title">${t('stepsOrderHeading')} (${course.steps.length})</h3>
-    ${course.steps.map((s,i)=>`
+    <h3 class="section-title">${t('stepsOrderHeading')} (${steps.length})</h3>
+    ${steps.map((s,i)=>`
       <div class="list-item">
         <div class="txt">${i+1}. ${esc(s.name)}</div>
         <div class="row" style="width:auto;gap:2px;">
           <button class="icon-btn up-down" data-act="rename-step" data-idx="${i}">✏️</button>
           <button class="icon-btn up-down" data-act="move-step" data-dir="up" data-idx="${i}" ${i===0?'disabled':''}>▲</button>
-          <button class="icon-btn up-down" data-act="move-step" data-dir="down" data-idx="${i}" ${i===course.steps.length-1?'disabled':''}>▼</button>
+          <button class="icon-btn up-down" data-act="move-step" data-dir="down" data-idx="${i}" ${i===steps.length-1?'disabled':''}>▼</button>
           <button class="icon-btn" data-act="del-step" data-idx="${i}">🗑</button>
         </div>
       </div>`).join('')}
+    `}
   `;
 }
 
@@ -969,16 +1007,18 @@ function statsFilteredStudents(){
 function adminStatsHtml(){
   if(!state.adminDeptId || !state.adminCourseId) return `<div class="banner">${t('pickContextHint')}</div>`;
   const course = getCourse(state.adminDeptId, state.adminCourseId);
-  const steps = course ? course.steps : [];
+  const assignedTypes = course ? (course.caseTypes||[]) : [];
   const students = statsFilteredStudents();
-  const rows = [];
+  let rows = [];
   students.forEach(st=> (st.cases||[]).forEach(cs=> rows.push({st, cs})) );
+  if(state.statsCaseTypeFilter) rows = rows.filter(({cs})=>cs.caseType===state.statsCaseTypeFilter);
   rows.sort((a,b)=> casePct(b.st,b.cs) - casePct(a.st,a.cs));
   const notStartedCount = students.filter(s=>(s.cases||[]).length===0).length;
+  const stepsForFilter = state.statsCaseTypeFilter ? caseSteps(course, state.statsCaseTypeFilter) : [];
   let stepSummary = '';
   if(state.statsStepId){
-    const stepDone = rows.filter(({st,cs})=>{
-      const p = ((PROGRESS[st.id]||{})[cs.id])||{};
+    const stepDone = rows.filter(({cs})=>{
+      const p = PROGRESS[cs.id]||{};
       return p[state.statsStepId] && p[state.statsStepId].done;
     }).length;
     stepSummary = `<div class="total-grade">${t('stepFilterSummary')}${stepDone}${t('ofTotalCases')}${rows.length}</div>`;
@@ -1005,11 +1045,20 @@ function adminStatsHtml(){
           </select>
         </div>` : ''}
       </div>
-      <div class="field" style="margin-bottom:14px;"><label>${t('stepFilterLabel')}</label>
-        <select id="stats-step-filter">
-          <option value="">${t('noStepFilter')}</option>
-          ${steps.map(s=>`<option value="${s.id}" ${state.statsStepId===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}
-        </select>
+      <div class="row" style="margin-bottom:14px;">
+        <div class="field" style="flex:1;margin-bottom:0;"><label>${fieldLabel('caseType')}</label>
+          <select id="stats-casetype-filter">
+            <option value="">${t('allOption')}</option>
+            ${assignedTypes.map(ctName=>`<option value="${esc(ctName)}" ${state.statsCaseTypeFilter===ctName?'selected':''}>${esc(ctName)}</option>`).join('')}
+          </select>
+        </div>
+        ${state.statsCaseTypeFilter ? `
+        <div class="field" style="flex:1;margin-bottom:0;"><label>${t('stepFilterLabel')}</label>
+          <select id="stats-step-filter">
+            <option value="">${t('noStepFilter')}</option>
+            ${stepsForFilter.map(s=>`<option value="${s.id}" ${state.statsStepId===s.id?'selected':''}>${esc(s.name)}</option>`).join('')}
+          </select>
+        </div>` : ''}
       </div>
       ${stepSummary}
       <div class="banner">${t('notStartedAnyCaseLabel')}<b>${notStartedCount}</b> / ${students.length}</div>
@@ -1020,12 +1069,13 @@ function adminStatsHtml(){
           ${rows.length===0 ? `<tr><td colspan="5" style="text-align:center;color:var(--teal-500);padding:16px;">${t('noDataYet')}</td></tr>` :
             rows.map(({st,cs})=>{
               const pct = casePct(st,cs);
-              const p = ((PROGRESS[st.id]||{})[cs.id])||{};
-              const done = steps.filter(s=>p[s.id]&&p[s.id].done).length;
+              const rowSteps = caseSteps(course, cs.caseType);
+              const p = PROGRESS[cs.id]||{};
+              const done = rowSteps.filter(s=>p[s.id]&&p[s.id].done).length;
               return `<tr>
                 <td>${esc(st.name)}</td><td>${esc(cs.caseType||t('caseLabel'))}</td>
                 <td><div class="row" style="align-items:center;gap:6px;width:auto;"><div class="bar-wrap"><div class="bar-fill" style="width:${pct}%;"></div></div><span>${pct}%</span></div></td>
-                <td>${done}/${steps.length}</td>
+                <td>${done}/${rowSteps.length}</td>
                 <td>${caseTotalGrade(st,cs)}</td>
               </tr>`;
             }).join('')}
@@ -1088,11 +1138,15 @@ function bindEvents(){
   if(scopeValSel) scopeValSel.addEventListener('change', e=>{ state.statsScopeValue = e.target.value; render(); });
   const stepFilterSel = document.getElementById('stats-step-filter');
   if(stepFilterSel) stepFilterSel.addEventListener('change', e=>{ state.statsStepId = e.target.value; render(); });
+  const statsCtSel = document.getElementById('stats-casetype-filter');
+  if(statsCtSel) statsCtSel.addEventListener('change', e=>{ state.statsCaseTypeFilter = e.target.value; state.statsStepId=''; render(); });
 
   const ctxDept = document.getElementById('ctx-dept');
   if(ctxDept) ctxDept.addEventListener('change', e=>{ state.adminDeptId = e.target.value; state.adminCourseId=''; render(); });
   const ctxCourse = document.getElementById('ctx-course');
-  if(ctxCourse) ctxCourse.addEventListener('change', e=>{ state.adminCourseId = e.target.value; render(); });
+  if(ctxCourse) ctxCourse.addEventListener('change', e=>{ state.adminCourseId = e.target.value; state.stepsCaseType=''; render(); });
+  const stepsCtSel = document.getElementById('steps-casetype-select');
+  if(stepsCtSel) stepsCtSel.addEventListener('change', e=>{ state.stepsCaseType = e.target.value; render(); });
 
   ['new-st-group','new-st-subgroup','new-st-level'].forEach(id=>{
     const sel = document.getElementById(id);
@@ -1187,7 +1241,15 @@ async function onAction(e){
     if(!st.cases) st.cases = [];
     checked.forEach(ct=>{ st.cases.push({ id: caseId(), caseType: ct, createdAt: new Date().toISOString(), partnerIds: [] }); });
     state.addingCaseFor = null;
+    let configChanged = false;
+    if(custom && course){
+      if(!CONFIG.caseTypes.includes(custom)){ CONFIG.caseTypes.push(custom); configChanged = true; }
+      if(!course.caseTypes.includes(custom)){ course.caseTypes.push(custom); configChanged = true; }
+      if(!course.caseTypeConfigs) course.caseTypeConfigs = [];
+      if(!course.caseTypeConfigs.some(c=>c.name===custom)){ course.caseTypeConfigs.push({name:custom, steps:[]}); configChanged = true; }
+    }
     await setData('students', STUDENTS);
+    if(configChanged) await setData('config', CONFIG);
     render(); return;
   }
   if(act==='toggle-link-partners'){
@@ -1204,21 +1266,42 @@ async function onAction(e){
     const sid = el.dataset.sid, cid = el.dataset.cid;
     const st = STUDENTS.find(s=>s.id===sid); if(!st) return;
     const cs = (st.cases||[]).find(c=>c.id===cid); if(!cs) return;
-    cs.partnerIds = [...document.querySelectorAll('.partner-chk:checked')].map(c=>c.value);
+    const newPartnerIds = [...document.querySelectorAll('.partner-chk:checked')].map(c=>c.value);
+    const oldPartnerIds = cs.partnerIds || [];
+
+    // remove the mirrored case from anyone who got unchecked (their own progress stays if they had any other link)
+    oldPartnerIds.filter(pid=>!newPartnerIds.includes(pid)).forEach(pid=>{
+      const partner = STUDENTS.find(s=>s.id===pid);
+      if(partner) partner.cases = (partner.cases||[]).filter(c=>c.id!==cid);
+    });
+
+    // mirror the same case (same id, so progress is shared) into every participant's own list
+    const allIds = [sid, ...newPartnerIds];
+    allIds.forEach(pid=>{
+      const person = STUDENTS.find(s=>s.id===pid);
+      if(!person) return;
+      if(!person.cases) person.cases = [];
+      let personCase = person.cases.find(c=>c.id===cid);
+      if(!personCase){
+        personCase = { id: cid, caseType: cs.caseType, createdAt: cs.createdAt, partnerIds: [] };
+        person.cases.push(personCase);
+      }
+      personCase.partnerIds = allIds.filter(x=>x!==pid);
+    });
+
     state.linkingPartnersFor = null;
     await setData('students', STUDENTS);
     render(); return;
   }
   if(act==='toggle-step'){
-    const sid = el.dataset.sid, cid = el.dataset.cid, stepid = el.dataset.stepid;
-    if(!PROGRESS[sid]) PROGRESS[sid] = {};
-    if(!PROGRESS[sid][cid]) PROGRESS[sid][cid] = {};
-    const cur = PROGRESS[sid][cid][stepid];
+    const cid = el.dataset.cid, stepid = el.dataset.stepid;
+    if(!PROGRESS[cid]) PROGRESS[cid] = {};
+    const cur = PROGRESS[cid][stepid];
     if(cur && cur.done){
       if(!confirm(cur.supervisor||'')) return;
-      delete PROGRESS[sid][cid][stepid];
+      delete PROGRESS[cid][stepid];
     } else {
-      PROGRESS[sid][cid][stepid] = { done:true, supervisor: state.currentSupervisor, date: new Date().toISOString(), grade:'', notes:'' };
+      PROGRESS[cid][stepid] = { done:true, supervisor: state.currentSupervisor, date: new Date().toISOString(), grade:'', notes:'' };
     }
     await setData('progress', PROGRESS);
     render(); return;
@@ -1227,9 +1310,9 @@ async function onAction(e){
     const sid = el.dataset.sid, cid = el.dataset.cid, stepid = el.dataset.stepid;
     const grade = document.getElementById(`grade-${sid}-${cid}-${stepid}`).value;
     const notes = document.getElementById(`notes-${sid}-${cid}-${stepid}`).value;
-    if(PROGRESS[sid] && PROGRESS[sid][cid] && PROGRESS[sid][cid][stepid]){
-      PROGRESS[sid][cid][stepid].grade = grade;
-      PROGRESS[sid][cid][stepid].notes = notes;
+    if(PROGRESS[cid] && PROGRESS[cid][stepid]){
+      PROGRESS[cid][stepid].grade = grade;
+      PROGRESS[cid][stepid].notes = notes;
       await setData('progress', PROGRESS);
     }
     render(); return;
@@ -1353,8 +1436,22 @@ async function onAction(e){
   if(act==='del-student'){
     if(!confirm(t('confirmDeleteStudent'))) return;
     const id = el.dataset.id;
+    const st = STUDENTS.find(s=>s.id===id);
+    if(st){
+      (st.cases||[]).forEach(cs=>{
+        const partners = cs.partnerIds||[];
+        if(partners.length===0){
+          delete PROGRESS[cs.id];
+        } else {
+          partners.forEach(pid=>{
+            const p = STUDENTS.find(s=>s.id===pid);
+            const pc = p && (p.cases||[]).find(c=>c.id===cs.id);
+            if(pc) pc.partnerIds = (pc.partnerIds||[]).filter(x=>x!==id);
+          });
+        }
+      });
+    }
     STUDENTS = STUDENTS.filter(s=>s.id!==id);
-    delete PROGRESS[id];
     await setData('students', STUDENTS);
     await setData('progress', PROGRESS);
     render(); return;
@@ -1403,43 +1500,51 @@ async function onAction(e){
     const course = getCourse(state.adminDeptId, state.adminCourseId); if(!course) return;
     const checked = [...document.querySelectorAll('.course-casetype-chk:checked')].map(el=>el.value);
     course.caseTypes = checked;
+    if(!course.caseTypeConfigs) course.caseTypeConfigs = [];
+    checked.forEach(name=>{
+      if(!course.caseTypeConfigs.some(c=>c.name===name)) course.caseTypeConfigs.push({name, steps:[]});
+    });
     const ok = await setData('config', CONFIG);
     if(ok) alert(t('brandSaved'));
     render(); return;
   }
   if(act==='add-step'){
     const course = getCourse(state.adminDeptId, state.adminCourseId); if(!course) return;
+    const cfg = caseTypeConfig(course, state.stepsCaseType); if(!cfg) return;
     const val = document.getElementById('new-step-name').value.trim();
     if(!val) return;
-    if(course.steps.some(s=>s.name===val)){ alert(t('alertDuplicateStep')); return; }
-    course.steps.push({id: stepId(), name: val});
+    if(cfg.steps.some(s=>s.name===val)){ alert(t('alertDuplicateStep')); return; }
+    cfg.steps.push({id: stepId(), name: val});
     await setData('config', CONFIG);
     render(); return;
   }
   if(act==='del-step'){
     const course = getCourse(state.adminDeptId, state.adminCourseId); if(!course) return;
+    const cfg = caseTypeConfig(course, state.stepsCaseType); if(!cfg) return;
     if(!confirm(t('confirmDeleteStep'))) return;
-    course.steps.splice(+el.dataset.idx,1);
+    cfg.steps.splice(+el.dataset.idx,1);
     await setData('config', CONFIG);
     render(); return;
   }
   if(act==='rename-step'){
     const course = getCourse(state.adminDeptId, state.adminCourseId); if(!course) return;
+    const cfg = caseTypeConfig(course, state.stepsCaseType); if(!cfg) return;
     const idx = +el.dataset.idx;
-    const step = course.steps[idx];
+    const step = cfg.steps[idx];
     const newName = prompt(t('promptNewStepName'), step.name);
     if(!newName || !newName.trim()) return;
-    if(course.steps.some((s,i)=>i!==idx && s.name===newName.trim())){ alert(t('alertDuplicateStep')); return; }
+    if(cfg.steps.some((s,i)=>i!==idx && s.name===newName.trim())){ alert(t('alertDuplicateStep')); return; }
     step.name = newName.trim();
     await setData('config', CONFIG);
     render(); return;
   }
   if(act==='move-step'){
     const course = getCourse(state.adminDeptId, state.adminCourseId); if(!course) return;
+    const cfg = caseTypeConfig(course, state.stepsCaseType); if(!cfg) return;
     const idx = +el.dataset.idx, dir = el.dataset.dir;
     const swap = dir==='up' ? idx-1 : idx+1;
-    if(swap<0 || swap>=course.steps.length) return;
-    [course.steps[idx], course.steps[swap]] = [course.steps[swap], course.steps[idx]];
+    if(swap<0 || swap>=cfg.steps.length) return;
+    [cfg.steps[idx], cfg.steps[swap]] = [cfg.steps[swap], cfg.steps[idx]];
     await setData('config', CONFIG);
     render(); return;
   }
@@ -1499,17 +1604,26 @@ async function onAction(e){
 
   if(act==='export-csv'){
     const course = getCourse(state.adminDeptId, state.adminCourseId);
-    const steps = course ? course.steps : [];
     const students = statsFilteredStudents();
+    let exportRows = [];
+    students.forEach(st=> (st.cases||[]).forEach(cs=> exportRows.push({st,cs})) );
+    if(state.statsCaseTypeFilter) exportRows = exportRows.filter(({cs})=>cs.caseType===state.statsCaseTypeFilter);
+    // union of step names across whichever case types actually appear in the export
+    const seenNames = new Set(), stepNameColumns = [];
+    exportRows.forEach(({cs})=>{ caseSteps(course, cs.caseType).forEach(s=>{ if(!seenNames.has(s.name)){ seenNames.add(s.name); stepNameColumns.push(s.name); } }); });
     let csv = '\uFEFF' + [t('tableStudent'), t('studentCodeLabel'), fieldLabel('group'), fieldLabel('subgroup'), fieldLabel('level'), t('tableCase'), t('partnersLabel').replace(': ',''), t('tablePct'), t('tableGrade')].map(h=>`"${h}"`).join(',') + ',';
-    csv += steps.map(s=>`"${s.name.replace(/"/g,'""')}"`).join(',') + '\n';
-    students.forEach(st=>{
-      (st.cases||[]).forEach(cs=>{
-        const p = ((PROGRESS[st.id]||{})[cs.id])||{};
-        const pct = casePct(st,cs);
-        const cells = steps.map(s => p[s.id]&&p[s.id].done ? `"${p[s.id].supervisor} - ${fmtDate(p[s.id].date)}${p[s.id].grade!==undefined&&p[s.id].grade!==''?' - '+p[s.id].grade:''}${p[s.id].notes?' - '+p[s.id].notes:''}"` : '-');
-        csv += `"${st.name}","${st.studentCode||''}","${st.group||''}","${st.subgroup||''}","${st.level||''}","${cs.caseType||''}","${partnerNames(st,cs).join('; ')}","${pct}%","${caseTotalGrade(st,cs)}",` + cells.join(',') + '\n';
+    csv += stepNameColumns.map(n=>`"${n.replace(/"/g,'""')}"`).join(',') + '\n';
+    exportRows.forEach(({st,cs})=>{
+      const p = PROGRESS[cs.id]||{};
+      const pct = casePct(st,cs);
+      const rowSteps = caseSteps(course, cs.caseType);
+      const cells = stepNameColumns.map(colName=>{
+        const step = rowSteps.find(s=>s.name===colName);
+        if(!step) return 'N/A';
+        const rec = p[step.id];
+        return rec && rec.done ? `"${rec.supervisor} - ${fmtDate(rec.date)}${rec.grade!==undefined&&rec.grade!==''?' - '+rec.grade:''}${rec.notes?' - '+rec.notes:''}"` : '-';
       });
+      csv += `"${st.name}","${st.studentCode||''}","${st.group||''}","${st.subgroup||''}","${st.level||''}","${cs.caseType||''}","${partnerNames(st,cs).join('; ')}","${pct}%","${caseTotalGrade(st,cs)}",` + cells.join(',') + '\n';
     });
     const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
     const url = URL.createObjectURL(blob);
