@@ -299,10 +299,21 @@ function fieldLabel(key){
 /* ---------------- Storage helpers (Google Sheets via Apps Script) ---------------- */
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxcF_MOXGB1zoO5Oe0DutoEyTU4Gl376r4U1z9VG0osixvaQt5e31Bum7i9Mz_I3fGD/exec";
 function scriptConfigured(){ return !!SCRIPT_URL && !SCRIPT_URL.includes('PASTE_YOUR'); }
+// fetch() has no built-in timeout — without this, a stalled connection leaves the UI stuck forever
+// (e.g. a disabled button stuck on "checking...") instead of showing a clear error.
+async function fetchWithTimeout(url, opts={}, ms=25000){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), ms);
+  try{
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 async function getData(key, fallback){
   if(!scriptConfigured()) return fallback;
   try{
-    const res = await fetch(`${SCRIPT_URL}?action=get&key=${encodeURIComponent(key)}`);
+    const res = await fetchWithTimeout(`${SCRIPT_URL}?action=get&key=${encodeURIComponent(key)}`);
     if(!res.ok) throw new Error('bad status ' + res.status);
     const json = await res.json();
     if(json && json.value !== undefined && json.value !== null) return JSON.parse(json.value);
@@ -315,7 +326,7 @@ async function setData(key, value){
   if(state.screen==='admin' && state.adminPass) auth = { role:'admin', password: state.adminPass };
   else if(state.screen==='supervisor' && state.currentSupervisor) auth = { role:'supervisor', name: state.currentSupervisor, password: state.currentSupervisorPass };
   try{
-    const res = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    const res = await fetchWithTimeout(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
       body: JSON.stringify({ action:'save', key, value: JSON.stringify(value), auth }) });
     if(!res.ok) throw new Error('bad status ' + res.status);
     const json = await res.json();
@@ -325,24 +336,24 @@ async function setData(key, value){
 }
 async function fetchSupervisorNames(){
   if(!scriptConfigured()) return [];
-  try{ const res = await fetch(`${SCRIPT_URL}?action=supervisor-names`); const json = await res.json(); return json.names || []; }
+  try{ const res = await fetchWithTimeout(`${SCRIPT_URL}?action=supervisor-names`); const json = await res.json(); return json.names || []; }
   catch(e){ return []; }
 }
 async function apiLoginSupervisor(name, password){
   if(!scriptConfigured()) return {ok:false};
   try{
-    const res = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    const res = await fetchWithTimeout(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
       body: JSON.stringify({ action:'login-supervisor', name, password }) });
     return await res.json();
-  }catch(e){ return {ok:false, networkError:true, error: e.message}; }
+  }catch(e){ return {ok:false, networkError:true, error: e.name==='AbortError' ? (state.lang==='ar'?'انتهت مهلة الاتصال':'Request timed out') : e.message}; }
 }
 async function apiLoginAdmin(password){
   if(!scriptConfigured()) return {ok:false};
   try{
-    const res = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    const res = await fetchWithTimeout(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
       body: JSON.stringify({ action:'login-admin', password }) });
     return await res.json();
-  }catch(e){ return {ok:false, networkError:true, error: e.message}; }
+  }catch(e){ return {ok:false, networkError:true, error: e.name==='AbortError' ? (state.lang==='ar'?'انتهت مهلة الاتصال':'Request timed out') : e.message}; }
 }
 
 const DEFAULT_STEPS_NAMES = [
